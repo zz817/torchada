@@ -207,6 +207,30 @@ export TORCHADA_ENABLE_CPP_OPS=1
 - `TORCHADA_DEBUG_CPP_OPS=1` - Log operator calls
 - `TORCHADA_DISABLE_OP_OVERRIDE_<OP_NAME>=1` - Disable specific operator override
 - `MTGPU_TARGET=mp_XX` - Override GPU architecture (auto-detected via `musaInfo`)
+- `TORCHADA_EXCLUDE_DIRS` - Colon-separated list of directories to exclude from CUDA→MUSA source porting
+
+## Excluding Directories from Source Porting
+
+When building C++ extensions on MUSA, `BuildExtension` automatically ports CUDA source directories to MUSA using `SimplePorting`. Some directories (e.g., third-party libraries, vendor kernels) should not be ported because they already have MUSA-compatible code or contain code that must not be modified.
+
+**Via environment variable**:
+```bash
+export TORCHADA_EXCLUDE_DIRS=/path/to/vendor/cub:/path/to/third_party/kernels
+```
+
+**Via subclass** (recommended for project-level customization):
+```python
+from torch.utils.cpp_extension import BuildExtension
+
+class MyBuildExt(BuildExtension):
+    def get_exclude_dirs(self):
+        return super().get_exclude_dirs() + [
+            "/path/to/vendor/cub",
+            "/path/to/third_party/kernels",
+        ]
+```
+
+Both mechanisms can be combined — env var entries and subclass entries are merged. Excluded directories and their subdirectories are skipped during porting; source files in excluded directories are used as-is.
 
 ## Security Considerations
 

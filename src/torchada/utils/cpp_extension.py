@@ -505,29 +505,103 @@ def _get_build_extension_class():
                     """
                     return _MAPPING_RULE.copy()
 
+                def get_exclude_dirs(self):
+                    """
+                    Get directories that should be excluded from CUDA->MUSA porting.
+
+                    Excluded directories will not be processed by SimplePorting, and
+                    their source files will be used as-is (without path conversion).
+
+                    This method also reads from the ``TORCHADA_EXCLUDE_DIRS`` environment
+                    variable, which accepts a path-separator (``:`` on Unix, ``;`` on
+                    Windows) delimited list of directory paths.
+
+                    Override this method in subclasses to add project-specific exclusions:
+
+                        class MyBuildExt(_MUSABuildExtension):
+                            def get_exclude_dirs(self):
+                                return super().get_exclude_dirs() + [
+                                    "/path/to/third_party/cub",
+                                    "/path/to/vendor/kernels",
+                                ]
+
+                    Returns:
+                        list[str]: List of absolute directory paths to exclude from porting
+                    """
+                    exclude_dirs = []
+                    # Read from environment variable TORCHADA_EXCLUDE_DIRS
+                    env_value = os.environ.get("TORCHADA_EXCLUDE_DIRS", "")
+                    if env_value:
+                        # Use os.pathsep for cross-platform compatibility
+                        # (':' on Unix, ';' on Windows)
+                        for d in env_value.split(os.pathsep):
+                            d = d.strip()
+                            if d:
+                                exclude_dirs.append(os.path.abspath(d))
+                    return exclude_dirs
+
                 def build_extensions(self):
                     # Register .cu, .cuh as valid source extensions
                     self.compiler.src_extensions += [".cu", ".cuh"]
                     super().build_extensions()
 
-                def _port_directory(self, source_dir, mapping_rule=None):
+                def _is_excluded_dir(self, dir_path, exclude_dirs=None):
+                    """
+                    Check if a directory should be excluded from porting.
+
+                    A directory is excluded if it exactly matches or is a subdirectory
+                    of any path in ``exclude_dirs``.
+
+                    Args:
+                        dir_path: Absolute path to the directory to check
+                        exclude_dirs: List of absolute directory paths to exclude.
+                            If None, uses get_exclude_dirs().
+
+                    Returns:
+                        bool: True if the directory should be excluded
+                    """
+                    if exclude_dirs is None:
+                        exclude_dirs = self.get_exclude_dirs()
+                    dir_path = os.path.abspath(dir_path)
+                    for exc in exclude_dirs:
+                        exc = os.path.abspath(exc)
+                        # Exact match or dir_path is a subdirectory of exc
+                        if dir_path == exc or dir_path.startswith(exc + os.sep):
+                            return True
+                    return False
+
+                def _port_directory(self, source_dir, mapping_rule=None, exclude_dirs=None):
                     """
                     Port a directory containing CUDA sources to MUSA.
 
                     When both .cu and .mu files exist with the same base name,
                     the .mu file takes precedence (it's the hand-written MUSA version).
 
+                    Excluded directories (as determined by ``_is_excluded_dir``) are
+                    skipped entirely — their sources are used as-is without porting.
+
                     Args:
                         source_dir: Path to directory containing CUDA sources
                         mapping_rule: Optional custom mapping rules (uses get_mapping_rule() if None)
+                        exclude_dirs: Optional list of directory paths to exclude from porting.
+                            If None, uses get_exclude_dirs().
 
                     Returns:
-                        str: Path to the ported directory (source_dir + "_musa")
+                        str: Path to the ported directory (source_dir + "_musa"),
+                            or source_dir itself if excluded
                     """
+                    if exclude_dirs is None:
+                        exclude_dirs = self.get_exclude_dirs()
+
+                    source_dir = os.path.abspath(source_dir)
+
+                    # Skip porting for excluded directories
+                    if self._is_excluded_dir(source_dir, exclude_dirs):
+                        return source_dir
+
                     if mapping_rule is None:
                         mapping_rule = self.get_mapping_rule()
 
-                    source_dir = os.path.abspath(source_dir)
                     musa_dir = source_dir + "_musa"
 
                     if source_dir not in self._ported_dirs:
@@ -556,23 +630,32 @@ def _get_build_extension_class():
 
                     return musa_dir
 
-                def _convert_source_path(self, source):
+                def _convert_source_path(self, source, exclude_dirs=None):
                     """
                     Convert a CUDA source path to its ported MUSA equivalent.
 
                     Args:
                         source: Original source file path (e.g., "csrc/kernel.cu")
+                        exclude_dirs: Optional list of directory paths to exclude from porting.
+                            If None, uses get_exclude_dirs().
 
                     Returns:
                         tuple: (converted_path, needs_porting)
                             - converted_path: Path to ported file (e.g., "csrc_musa/kernel.mu")
                             - needs_porting: True if the source directory needs porting
                     """
+                    if exclude_dirs is None:
+                        exclude_dirs = self.get_exclude_dirs()
+
                     source_path = os.path.abspath(source)
                     source_dir = os.path.dirname(source_path)
                     source_file = os.path.basename(source_path)
                     base_name, ext_name = os.path.splitext(source_file)
                     ext_name_lower = ext_name.lower()
+
+                    # If the source directory is excluded, use the file as-is
+                    if self._is_excluded_dir(source_dir, exclude_dirs):
+                        return source, False
 
                     # Port all source files that may contain CUDA references:
                     # - .cu/.cuh: CUDA source/header files
@@ -603,12 +686,14 @@ def _get_build_extension_class():
 
                     This method:
                     1. Identifies CUDA source directories from extension sources
-                    2. Ports each directory using SimplePorting (like torch's HIPIFY)
-                    3. Updates source paths to point to ported files
-                    4. Ports include directories as well
-                    5. Calls parent run() to perform actual compilation
+                    2. Excludes directories listed in get_exclude_dirs()
+                    3. Ports each non-excluded directory using SimplePorting (like torch's HIPIFY)
+                    4. Updates source paths to point to ported files
+                    5. Ports include directories as well
+                    6. Calls parent run() to perform actual compilation
                     """
                     mapping_rule = self.get_mapping_rule()
+                    exclude_dirs = self.get_exclude_dirs()
 
                     for ext in self.extensions:
                         new_sources = []
@@ -619,7 +704,7 @@ def _get_build_extension_class():
                             (
                                 new_source,
                                 needs_porting,
-                            ) = self._convert_source_path(source)
+                            ) = self._convert_source_path(source, exclude_dirs)
                             new_sources.append(new_source)
                             if needs_porting:
                                 source_dir = os.path.dirname(os.path.abspath(source))
@@ -628,9 +713,9 @@ def _get_build_extension_class():
                         dirs_to_port = sorted(
                             dirs_to_port, key=lambda p: p.count("/"), reverse=True
                         )
-                        # Port each unique directory
+                        # Port each unique directory (excluded dirs are filtered inside _port_directory)
                         for cuda_dir in dirs_to_port:
-                            self._port_directory(cuda_dir, mapping_rule)
+                            self._port_directory(cuda_dir, mapping_rule, exclude_dirs)
 
                         # Update extension sources to point to ported files
                         ext.sources = new_sources
@@ -671,7 +756,9 @@ def _get_build_extension_class():
                                         pass
 
                                     if has_cuda_headers:
-                                        ported_dir = self._port_directory(inc_dir_abs, mapping_rule)
+                                        ported_dir = self._port_directory(
+                                            inc_dir_abs, mapping_rule, exclude_dirs
+                                        )
                                         # Add ported dir first so ported headers take precedence
                                         if os.path.isdir(ported_dir):
                                             new_include_dirs.append(ported_dir)
